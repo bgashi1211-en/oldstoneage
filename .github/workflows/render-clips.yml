@@ -1,0 +1,100 @@
+name: Render Clips
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:   ${{ steps.discover.outputs.matrix }}
+      has_work: ${{ steps.discover.outputs.has_work }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install gdown
+        run: pip install gdown --break-system-packages
+      - name: Discover clip files
+        id: discover
+        run: |
+          python3 << 'PYEOF'
+          import json, os, sys, time
+          from pathlib import Path
+          import gdown
+          CLIPS_FOLDER = "1Noj7fu2_ejCXuaT9mgJftHK1gacSj9nO"
+          TMP_DIR = Path("/tmp/discover_clips")
+          TMP_DIR.mkdir(parents=True, exist_ok=True)
+          for attempt in range(1, 4):
+              try:
+                  gdown.download_folder(id=CLIPS_FOLDER, output=str(TMP_DIR), quiet=False)
+                  break
+              except Exception as e:
+                  print(f"Attempt {attempt}/3 failed: {e}")
+                  if attempt == 3:
+                      sys.exit(1)
+                  time.sleep(30 * attempt)
+          VALID_EXT = {'.mp4', '.mov', '.webm'}
+          files = sorted(p for p in TMP_DIR.rglob("*") if p.suffix.lower() in VALID_EXT and p.is_file())
+          if not files:
+              sys.exit(1)
+          print(f"Found {len(files)} clip file(s):")
+          for f in files:
+              print(f"  {f.name}")
+          matrix = {"include": [{"clip_name": f.name} for f in files]}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"matrix={json.dumps(matrix)}\n")
+              fh.write("has_work=true\n")
+          PYEOF
+  render:
+    needs: discover
+    if: needs.discover.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" \
+            /usr/local/share/powershell /usr/share/swift || true
+          sudo apt-get clean -qq
+          docker system prune -af --volumes || true
+          df -h
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --fix-missing ffmpeg
+          pip install gdown --break-system-packages
+      - name: Render
+        id: render
+        env:
+          TARGET_CLIP_NAME: ${{ matrix.clip_name }}
+        run: python3 kento.py
+      - name: Tag
+        id: tag
+        run: |
+          TS=$(date -u +"%Y%m%d-%H%M%S")
+          SAFE=$(echo "${{ matrix.clip_name }}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          echo "tag=clip-${TS}-${SAFE}" >> "$GITHUB_OUTPUT"
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "${{ matrix.clip_name }} — ${{ steps.render.outputs.final_size_mb }} MB"
+          body: |
+            | Field | Value |
+            |---|---|
+            | **Clip** | `${{ matrix.clip_name }}` |
+            | **Audio** | ${{ steps.render.outputs.audio_used }} |
+            | **Size** | ${{ steps.render.outputs.final_size_mb }} MB |
+            | **Duration** | ${{ steps.render.outputs.duration_seconds }}s |
+            | **Stop** | ${{ steps.render.outputs.stop_reason }} |
+          files: ${{ steps.render.outputs.output_path }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
